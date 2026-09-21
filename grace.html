@@ -425,7 +425,7 @@ body.popups-open #subtitle{font-weight:700 !important; color:#5a4630; background
       <input id="textIn" type="text" placeholder='Type here, e.g. "tell me a joke"' autocomplete="off">
       <button id="btnAsk">Ask</button>
     </div>
-    <div id="wakeHint">Say, <b>"Hey Grace"</b> to speak</div>
+    <div id="wakeHint">Say, <b>"Grace"</b> to speak</div>
   </div>
   <div id="subtitle">How can I help you today?</div>
 </main>
@@ -534,14 +534,16 @@ const S = {
   speechWatch:null, // watchdog that clears a stuck "speaking" glow
   followUpUntil:0, // 2s after she speaks: no wake word needed to talk to her
   ignoreUntil:0, muted: store.get("muted", false),
-  name: store.get("name",""),            // user's name
+  name: store.get("name","Jessica"),         // user's name
   aiName: store.get("aiName","Grace"),    // assistant's display name
   webAccess: store.get("webAccess", true),
   memories: store.get("memories", []),
   loc: store.get("loc", null),
-  timers: [], lastSpoken:"", orbMode:"idle", wakeLock:null, pulse:0,
+  timers: [], lastSpoken:"", hist:[], orbMode:"idle", wakeLock:null, pulse:0,
   gen:0, genCancel:false // gen>0 while she's generating; mic ignores everything but "luna" then
 };
+// one-time migration: role-based names ("Mom") become real first names
+if(S.name==="Mom"){ S.name="Jessica"; store.set("name","Jessica"); }
 
 // true while Grace is in the middle of generating anything
 function generating(){ return (S.gen||0)>0; }
@@ -628,11 +630,12 @@ function draw(){
   rctx.clearRect(0,0,w,w);
 
   // soft honey-peach halo behind the orb
-  const halo=rctx.createRadialGradient(cx,cy,R*0.4,cx,cy,R*2.1);
+  const haloR=Math.min(R*2.1,w*0.49);
+  const halo=rctx.createRadialGradient(cx,cy,R*0.4,cx,cy,haloR);
   halo.addColorStop(0,"rgba(238,168,100,"+(0.28+A*0.35).toFixed(3)+")");
   halo.addColorStop(1,"rgba(238,168,100,0)");
   rctx.fillStyle=halo;
-  rctx.beginPath(); rctx.arc(cx,cy,R*2.1,0,Math.PI*2); rctx.fill();
+  rctx.beginPath(); rctx.arc(cx,cy,haloR,0,Math.PI*2); rctx.fill();
 
   // the honey-gold orb itself — bright core, warm rim
   const rr=R*(1+A*0.10);
@@ -643,7 +646,7 @@ function draw(){
   g.addColorStop(1,"#bd7a1a");
   rctx.save();
   rctx.shadowColor="rgba(235,165,90,"+(0.55+A*0.45).toFixed(3)+")";
-  rctx.shadowBlur=24+A*70;
+  rctx.shadowBlur=Math.min(24+A*70,Math.max(0,w*0.5-rr-6));
   rctx.fillStyle=g;
   rctx.beginPath(); rctx.arc(cx,cy,rr,0,Math.PI*2); rctx.fill();
   rctx.restore();
@@ -659,7 +662,7 @@ function draw(){
   rctx.save();
   for(let i=0;i<7;i++){
     const a=ringT*0.35+i*(Math.PI*2/7);
-    const d=rr+22+Math.sin(ringT*0.9+i*1.7)*10;
+    const d=Math.min(rr+22+Math.sin(ringT*0.9+i*1.7)*10,w*0.47);
     const x=cx+Math.cos(a)*d, y=cy+Math.sin(a)*d*0.85;
     const tw=0.25+0.55*Math.abs(Math.sin(ringT*1.6+i*2.1))*(speaking?1:0.45);
     rctx.fillStyle="rgba(255,220,150,"+tw.toFixed(3)+")";
@@ -764,14 +767,15 @@ function chime(){ beep(880,0.12,0); beep(1320,0.16,0.12); }
 // speakToken guarantees only the newest utterance ever starts: if a newer
 // speak() arrives while this one is still queued, the older one is dropped
 // instead of starting, getting cut, and restarting (the stutter bug).
-/* ============ INTERNET VOICE (StreamElements TTS, free keyless) ============
+/* ============ INTERNET VOICE (ResponsiveVoice TTS, free keyless) ============
    REPLACES the whole span in grace.html starting at the comment line
      // prompt + type bubble fade while someone is talking:
    through the end of utter() (the line right before `function speak(text){`).
    PER-BUILD: set USE_NET_VOICE=true and NET_VOICE_NAME below.
-     Ace:      "Brian"   (British male)
-     Grace:    "Joanna"  (warm US female)
-     Barnabas: "Matthew" (deepest US male; no southern-accent voice exists free)
+     Melodie:  "UK English Female" (warm female)
+     Ace:      "UK English Male"   (British male)
+     Grace:    "US English Female" (warm US female)
+     Barnabas: "US English Male"   (deep US male)
    Also required (see build brief):
    - after EVERY `speechSynthesis.cancel()` outside this block, add `stopNetAudio();`
      (interrupt path ~line 835, and the watchdog inside deviceUtter is already handled)
@@ -786,7 +790,10 @@ function showPrompt(){ for(const id of ["wakeHint","typeRow"]){ const h=$(id); i
 
 // ---- internet voice config (PER-BUILD) ----
 const USE_NET_VOICE = true;
-const NET_VOICE_NAME = "Joanna"; // Grace: warm US female (StreamElements)
+const NET_VOICE_NAME = "US English Female"; // Grace: warm US female (ResponsiveVoice, internet)
+const NET_VOICE_TL = "en-US";
+const NET_VOICE_PITCH = "0.5"; // 0.5 = default; lower = deeper
+const NET_VOICE_RATE = "0.5"; // 0.5 = default; lower = slower
 
 let speakToken=0;
 let netAudioEl=null;
@@ -838,32 +845,52 @@ function netUtter(text,my,onDone,onStart){
   // cosmetic ring pulse while the network audio plays (no onboundary here)
   clearInterval(S.resumeTimer);
   S.resumeTimer=setInterval(()=>{ S.pulse=1; },900);
-  const a=(audioUnlocked&&ttsAudio)||new Audio();
-  try{ a.pause(); }catch(e){}
-  netAudioEl=a;
-  let finished=false;
-  const done=()=>{ if(finished||my!==speakToken) return; finished=true; netAudioEl=null; if(onStart)onStart(); fin(); };
+  // long replies are split into sentence chunks — one mp3 per chunk, played
+  // back to back, so a long answer never gets cut off mid-sentence
+  const parts=String(text).match(/[^.!?]+[.!?]+["'”)’]?|[^.!?]+$/g)||[String(text)];
+  const chunks=[];
+  let cur="";
+  for(const part of parts){
+    if((cur.length+part.length)>700){ if(cur.trim()) chunks.push(cur.trim()); cur=part; }
+    else cur=cur?cur+" "+part:part;
+  }
+  if(cur.trim()) chunks.push(cur.trim());
+  let ci=0, finished=false;
+  const doneAll=()=>{ if(finished||my!==speakToken) return; finished=true; netAudioEl=null; if(onStart)onStart(); fin(); };
   const fallBack=()=>{ if(finished||my!==speakToken) return; finished=true; netAudioEl=null; deviceUtter(text,my,onDone,onStart); };
-  a.onended=done;
-  a.onplaying=()=>{ if(onStart) onStart(); }; // her words appear the moment the audio starts
-  a.onerror=fallBack;
-  a.src="https://api.streamelements.com/kappa/v2/speech?voice="+encodeURIComponent(NET_VOICE_NAME)+
-        "&text="+encodeURIComponent(String(text).slice(0,800));
-  try{ a.load(); }catch(e){}
-  try{
-    const p=a.play();
-    if(p&&p.catch) p.catch(fallBack);
-  }catch(e){ fallBack(); return; }
-  clearTimeout(S.speechWatch);
-  // if the mp3 hasn't started in 10s, the endpoint is flaky -> device voice
-  S.speechWatch=setTimeout(()=>{ if(!finished&&my===speakToken&&(a.paused||a.currentTime===0)) fallBack(); },10000);
+  const playChunk=()=>{
+    if(finished||my!==speakToken) return;
+    if(ci>=chunks.length){ doneAll(); return; }
+    const a=(audioUnlocked&&ttsAudio)||new Audio();
+    try{ a.volume=1; }catch(e){}
+    try{ a.pause(); }catch(e){}
+    netAudioEl=a;
+    const chunkDone=()=>{ if(finished||my!==speakToken) return; ci++; playChunk(); };
+    a.onended=chunkDone;
+    a.onplaying=()=>{ if(onStart) onStart(); }; // words appear the moment the audio starts
+    a.onerror=fallBack;
+    a.src="https://code.responsivevoice.org/getvoice.php?t="+encodeURIComponent(chunks[ci])+
+          "&tl="+NET_VOICE_TL+"&sv=g1&vn="+encodeURIComponent(NET_VOICE_NAME)+"&pitch="+NET_VOICE_PITCH+"&rate="+NET_VOICE_RATE+"&vol=1";
+    try{ a.load(); }catch(e){}
+    try{
+      const p=a.play();
+      if(p&&p.catch) p.catch(fallBack);
+    }catch(e){ fallBack(); return; }
+    clearTimeout(S.speechWatch);
+    // if the mp3 hasn't started in 10s, the endpoint is flaky -> device voice
+    S.speechWatch=setTimeout(()=>{ if(!finished&&my!==speakToken&&(a.paused||a.currentTime===0)) fallBack(); },10000);
+  };
+  if(!chunks.length){ doneAll(); return; }
+  playChunk();
   // absolute cap so a stuck stream can't talk forever
-  setTimeout(()=>{ if(!finished&&my===speakToken) done(); },120000);
+  setTimeout(()=>{ if(!finished&&my!==speakToken) doneAll(); },180000);
 }
+
 
 // device-voice path: the original utter() body, used as automatic fallback
 function deviceUtter(text,my,onDone,onStart){
   const u=new SpeechSynthesisUtterance(text);
+  try{ u.volume=1; }catch(e){}
   const v=pickVoice(); if(v) u.voice=v;
   u.rate=1.02; u.pitch=1;
   u.onstart=()=>{
@@ -1095,8 +1122,15 @@ async function handleSports(q){
 
 // she shows the words exactly when she starts saying them — never before.
 // opts: {onDone, chat:false} — chat:false shows only the subtitle (no transcript line)
+// ---- conversation memory: what was just said (this session) ----
+function pushHist(w,t){ t=String(t||"").replace(/\s+/g," ").trim().slice(0,150); if(!t) return; S.hist=S.hist||[]; S.hist.push({w:w,t:t}); while(S.hist.length>6) S.hist.shift(); }
+function histPrompt(){
+  if(!S.hist||!S.hist.length) return "";
+  return "Recent conversation (you are "+S.aiName+"):\n"+S.hist.map(h=>((h.w==="ai"?"You":(S.name||"User"))+": "+h.t)).join("\n")+"\n\n";
+}
 function speak(text,opts){
   text=String(text||""); if(!text.trim()) return;
+  if(!(opts&&opts.hist===false)) pushHist("ai",text);
   opts=opts||{};
   let shown=false;
   function show(){
@@ -1126,9 +1160,9 @@ document.addEventListener("visibilitychange",()=>{
 });
 
 // ---------- speech recognition ----------
-const WAKE_RE=/\bhey\s+grace\b/i;
+const WAKE_RE=/\b(?:hey\s+)?grace\b/i;
 // heard while she's mid-sentence → stop talking immediately ("hey luna", "stop", "shhh")
-const INTERRUPT_RE=/\bhey\s+grace\b|\bgrace\s+stop\b|\bstop\b|\bstop talking\b|\bsh+u*t+\s*up\b|\bquiet\b/i;
+const INTERRUPT_RE=/\b(?:hey\s+)?grace\b|\bgrace\s+stop\b|\bstop\b|\bstop talking\b|\bsh+u*t+\s*up\b|\bquiet\b/i;
 function startListening(){
   const R=window.SpeechRecognition||window.webkitSpeechRecognition;
   if(!R){ setStatus(false,"NO SPEECH SUPPORT"); speak("Speech recognition isn't supported in this browser."); return; }
@@ -1154,6 +1188,7 @@ function startListening(){
       // a stop word ("stop", "luna stop", "shut up") always means silence —
       // even when her name is in there too
       if(!/\bstop\b|\bsh+u*t+\s*up\b|\bquiet\b/i.test(heard)&&WAKE_RE.test(heard)){
+        S.hist=[]; // fresh "hey <name>": new topic, forget the last one
         // "hey luna" while she's talking: stop cold, then just ding and listen — no voice reply
         const hadMail=!!(S.mail&&S.mail.open);
         if(hadMail){ closeMail(); S.mail=null; addMsg("luna","Email scrapped."); }
@@ -1211,7 +1246,7 @@ function startListening(){
     S.listening=true; S.micOn=true; S.awaiting=false; S.buffer="";
     btnMic.classList.add("live"); btnMic.textContent="⏹";
     $("permMicVal").textContent="On";
-    setStatus(true,'LISTENING — SAY "HEY '+S.aiName.toUpperCase()+'"');
+    setStatus(true,'LISTENING — SAY "GRACE"');
     requestWakeLock();
   }catch(e){ setStatus(false,"MIC ERROR"); }
 }
@@ -1261,7 +1296,7 @@ async function toggleMic(){
   btnMic.classList.toggle("live",S.micOn);
   btnMic.textContent=S.micOn?"⏹":"🎤";
   $("permMicVal").textContent=S.micOn?"On":"Off";
-  if(S.micOn) setStatus(true,'LISTENING — SAY "HEY '+S.aiName.toUpperCase()+'"');
+  if(S.micOn) setStatus(true,'LISTENING — SAY "GRACE"');
   else{ setStatus(false,"MIC PAUSED — TAP 🎤 TO RESUME"); S.orbMode="idle"; S.awaiting=false; cmdBuf=""; }
 }
 function stopListening(){
@@ -1290,6 +1325,7 @@ function routeHeard(finals,interim){
   if(m) cancelGen(); // her name breaks through: tell any long job to stop quietly
   const emailHot=!!(S.mail&&S.mail.open);
   const inFollowUp=Date.now()<S.followUpUntil||(emailHot&&!aiSpeaking());
+  if(m&&!inFollowUp) S.hist=[]; // "hey <name>" out of the blue: new topic, forget the last one
   if(!m&&!inFollowUp){
     // she just acted but you're still talking: don't drop the rest — hear it as a new command
     if(Date.now()<(S.recentCmdUntil||0)&&text.replace(/[.,!?…\s]/g,"").length>1){ queueCommand(text); return; }
@@ -1359,6 +1395,7 @@ function handleCommand(raw){
   const text=stripFiller(raw.trim().replace(/\s+/g," "));
   if(!text) return;
   addMsg("you",text);
+  pushHist("user",text); // every request recorded once, here — handlers must not re-push
   S.lastCmd=text;
   S.orbMode="thinking";
   const tl=text.toLowerCase();
@@ -1391,7 +1428,9 @@ function handleCommand(raw){
       if(await tryNotes(tl,text)) return done();
       if(await tryGraceRecipe(tl,text)) return done();
       if(await tryMemory(tl,text)) return done();
+      if(await tryJokes(tl,text)) return done();
       if(await tryPersonality(tl,text)) return done();
+      if(await tryOpinions(tl,text)) return done();
       if(await tryFiles(tl,text)) return done();
       if(await tryMailComposer(tl,text)) return done();
       if(await tryEmail(tl,text)) return done();
@@ -1421,6 +1460,42 @@ function needWeb(){
 }
 
 /* ---------------- system ---------------- */
+/* ---------------- live jokes: quick internet search, spoken directly (no window) ---------------- */
+const JOKE_FALLBACK="My joke book seems to be stuck shut at the moment. Ask me again in a second and I will have one ready.";
+const JOKE_ALIAS={british:"england",uk:"england",english:"england",american:"america"};
+function jokeTopic(tl){
+  let m=tl.match(/\bjokes?\b\s+about\s+([a-z]+(?:\s+[a-z]+)?)/)
+       ||tl.match(/(?:tell|give|say|got|know|hear|want|need)\s+(?:me\s+)?(?:a|an|another|some|any)?\s*([a-z]+(?:\s+[a-z]+)?)\s*jokes?\b/)
+       ||tl.match(/^\s*([a-z]+(?:\s+[a-z]+)?)\s+jokes?\b/);
+  let t=m?m[1].trim():"";
+  if(/^(a|an|the|some|any|another|funny|good|great|best|new|clean|nice|silly)$/.test(t)) t="";
+  return JOKE_ALIAS[t]||t;
+}
+async function fetchJoke(topic){
+  let url="https://v2.jokeapi.dev/joke/Any?blacklistFlags=nsfw,religious,political,racist,sexist,explicit";
+  if(topic) url+="&contains="+encodeURIComponent(topic);
+  const r=await fetch(url);
+  if(!r.ok) return null;
+  const j=await r.json();
+  if(j.error) return null;
+  if(j.type==="single"&&j.joke) return j.joke;
+  if(j.type==="twopart"&&j.setup&&j.delivery) return j.setup+" "+j.delivery;
+  return null;
+}
+async function tryJokes(tl,text){
+  if(!/(\bjokes?\b|make me laugh|something funny)/.test(tl)) return false;
+  if(!needWeb()) return true;
+  let joke=null;
+  try{
+    const topic=jokeTopic(tl);
+    joke=await fetchJoke(topic);
+    if(!joke&&topic) joke=await fetchJoke("");
+  }catch(e){}
+  if(!joke) joke=JOKE_FALLBACK;
+  speak(joke);
+  return true;
+}
+
 const JOKES=[
  "Why do programmers prefer dark mode? Because light attracts bugs.",
  "I told my computer I needed a break, and now it won't stop sending me KitKat ads.",
@@ -1455,7 +1530,7 @@ async function trySystem(tl,text){
     return true;
   }
   if(/^(help|what can you do|commands)$/.test(tl)||tl.includes("what can you do")){
-    speak("Here's what I can do, hon. Just say Hey Grace, then ask. I can find recipes and read them to you step by step, set baking timers, and keep your saved recipes. I can check sports scores, look things up and explain them, find and play YouTube videos and songs, check the weather, do math, keep lists and notes, and remember things for you. I can write letters and guides in a side window, draft emails, read you the news, and teach you about anything. I can also help you shop — I'll show you options with links to the store websites. If I ever misunderstand, just say it a different way.");
+    speak("Here's what I can do, hon. Just say Grace, then ask. I can find recipes and read them to you step by step, set baking timers, and keep your saved recipes. I can check sports scores, look things up and explain them, find and play YouTube videos and songs, check the weather, do math, keep lists and notes, and remember things for you. I can write letters and guides in a side window, draft emails, read you the news, and teach you about anything. I can also help you shop — I'll show you options with links to the store websites. If I ever misunderstand, just say it a different way.");
     return true;
   }
   if(/\bjoke\b/.test(tl)){ speak(JOKES[Math.floor(Math.random()*JOKES.length)]); return true; }
@@ -1669,9 +1744,11 @@ async function tryGraceRecipe(tl,text){
     if(/\brepeat\b/.test(tl)){ recipeSay(); return true; }
   }
   // find a new recipe
-  m=tl.match(/(?:find|get|look up|show me)(?: me)? a (.+?) recipe\b/)||tl.match(/\brecipe for (.+)/)||tl.match(/(.+?) recipe$/);
+  m=tl.match(/(?:find|get|look up|show me|looking for|tell me)(?: me)? a (.+?) recipe\b/)||tl.match(/\brecipe for (.+)/)||tl.match(/(.+?) recipe$/);
   if(!m) return false;
-  const dish=m[1].trim().replace(/[.?!,]+$/,"");
+  // never let the wake word or filler verbs leak into the dish name
+  const dish=m[1].trim().replace(/[.?!,]+$/,"").replace(/^(?:hey\s+)?grace\s+/i,"")
+    .replace(/^(?:please\s+|tell\s+me\s+(?:a\s+)?|looking\s+for\s+(?:a\s+)?|find\s+(?:me\s+)?(?:a\s+)?|get\s+(?:me\s+)?(?:a\s+)?|show\s+me\s+(?:a\s+)?|look\s+up\s+(?:a\s+)?)/i,"").trim();
   if(!dish||dish.length<2) return false;
   if(!needWeb()) return true;
   setSubtitle("Finding a "+dish+" recipe…"); S.orbMode="thinking";
@@ -1721,9 +1798,19 @@ async function fetchWeather(lat,lon,name){
   const j=await r.json();
   const c=j.current, d=j.daily;
   const cond=WMO[c.weather_code]||"changing conditions";
-  return "In "+name+" it's "+Math.round(c.temperature_2m)+"°F and "+cond+", humidity "+c.relative_humidity_2m+"%, wind "+Math.round(c.wind_speed_10m)+" mph. "+
-    "Today's high "+Math.round(d.temperature_2m_max[0])+", low "+Math.round(d.temperature_2m_min[0])+
-    ", rain chance "+(d.precipitation_probability_max[0]??0)+"%. Tomorrow: high "+Math.round(d.temperature_2m_max[1])+", low "+Math.round(d.temperature_2m_min[1])+".";
+  const temp=Math.round(c.temperature_2m), high=Math.round(d.temperature_2m_max[0]), low=Math.round(d.temperature_2m_min[0]);
+  const rain=(d.precipitation_probability_max[0]??0);
+  const emoji=/clear/.test(cond)?"\u2600\uFE0F":/partly/.test(cond)?"\u26C5":/overcast/.test(cond)?"\u2601\uFE0F":/fog/.test(cond)?"\uD83C\uDF2B\uFE0F":/drizzle|rain|shower/.test(cond)?"\uD83C\uDF27\uFE0F":/snow/.test(cond)?"\u2744\uFE0F":/thunder|storm/.test(cond)?"\u26C8\uFE0F":"\uD83C\uDF24\uFE0F";
+  try{ openMini("Weather in "+name,
+    '<div style="text-align:center;padding:6px">'+
+    '<div style="font-size:54px;line-height:1.2">'+emoji+'</div>'+
+    '<div style="font-size:46px;font-weight:700;margin:2px 0">'+temp+'°F</div>'+
+    '<div style="font-size:18px;opacity:.85;text-transform:capitalize">'+cond+'</div>'+
+    '<div style="margin-top:10px;font-size:15px;opacity:.7">High '+high+'°F &middot; Low '+low+'°F &middot; Rain '+rain+'%</div>'+
+    '</div>',true); }catch(e){}
+  return "In "+name+" it's "+temp+"°F and "+cond+", humidity "+c.relative_humidity_2m+"%, wind "+Math.round(c.wind_speed_10m)+" mph. "+
+    "Today's high "+high+", low "+low+
+    ", rain chance "+rain+"%. Tomorrow: high "+Math.round(d.temperature_2m_max[1])+", low "+Math.round(d.temperature_2m_min[1])+".";
 }
 async function tryWeather(tl,text){
   if(!/weather/.test(tl)) return false;
@@ -1731,7 +1818,7 @@ async function tryWeather(tl,text){
   let m=tl.match(/weather in (.+)/);
   if(m){
     const place=m[1].trim();
-    speak("Looking up the weather in "+place+"…");
+    speak("Looking up the weather in "+place+"…",{hist:false});
     try{
       const g=await geocode(place);
       if(!g){ speak("I couldn't find "+place+". Try another city name."); return true; }
@@ -1754,7 +1841,7 @@ async function tryWeather(tl,text){
     speak("I don't know where you are yet. Say: set my location to, then your city — or ask: weather in, then a city name.");
     return true;
   }
-  speak("Checking the weather…");
+  speak("Checking the weather…",{hist:false});
   try{ speak(await fetchWeather(S.loc.lat,S.loc.lon,S.loc.name)); }
   catch(e){ loadFail(); }
   return true;
@@ -2565,6 +2652,35 @@ async function tryWiki(tl,text){
 
 /* ---------------- personality: warm, playful, a little cheeky ---------------- */
 function cap1(s){ s=s.trim().replace(/[?.!]+$/,""); return s?s.charAt(0).toUpperCase()+s.slice(1):s; }
+/* ---------------- opinions: answered in character, NEVER searched ---------------- */
+const OPINION_WHO="a warm, nurturing assistant with a motherly manner who shares Mom's love of baking and faith \u2014 you are her assistant, NOT Mom";
+const OPINION_FALLBACK="Hmm, hon, I don't have a strong take on that one \u2014 but ask me about cakes or baking anytime.";
+const OPINIONS=[
+  [/\bcake\b/, "My favorite is a homemade chocolate layer cake with real buttercream \u2014 nothing else comes close, hon."],
+  [/\bbutter\b|\bmargarine\b/, "Butter, every single time, hon \u2014 margarine can't touch it."],
+  [/\bvanilla\b/, "Real vanilla, always \u2014 imitation just isn't the same."],
+  [/\bcomfort food\b/, "A warm slice of cake with a cup of tea fixes just about anything, hon."],
+  [/\bhymn\b/, "Amazing Grace \u2014 it never gets old."],
+  [/\bsunday dinner\b|\bfamily dinner\b/, "Sunday dinner with the whole family \u2014 best part of the week, hon."],
+];
+function isOpinionQ(tl){ return /\b(favorite|favourite|best|opinion|what do you think|do you like|do you love)\b/.test(tl); }
+async function answerOpinion(tl,text){
+  const sys="You are "+S.aiName+", "+OPINION_WHO+". Answer in first person as \"I\" from your own tastes and opinions (never your own name, never third person): 1 or 2 short sentences, plain everyday words. This is YOUR opinion \u2014 never say you don't know, never say you'll look it up, never mention the web or searching.";
+  let ans="";
+  try{ ans=await brainRaw(text.slice(0,400),sys,20000); }catch(e){}
+  ans=String(ans||"").replace(/^"+|"+$/g,"").trim();
+  if(!ans||ans.length<2||/^\s*research\s*:/i.test(ans)) ans=OPINION_FALLBACK;
+  ans=ans.slice(0,600);
+  addMsg("luna",ans);
+  speak(ans,{chat:false});
+  return true;
+}
+async function tryOpinions(tl,text){
+  if(!isOpinionQ(tl)) return false;
+  for(const [re,ans] of OPINIONS){ if(re.test(tl)){ speak(ans); return true; } }
+  await answerOpinion(tl,text);
+  return true;
+}
 function tryPersonality(tl,text){
   let m;
   const me=S.name||"your favorite human";
@@ -2612,7 +2728,11 @@ async function tryBrain(tl,text){
   if(!S.webAccess){ smallTalkFallback(); return true; }
   setSubtitle("Thinking…"); S.orbMode="thinking";
   try{
-    const sys="You are Grace, a warm, motherly voice helper living on Mom's iPad. You love baking cakes for your family, and you love God most of all. "+
+    const sys="You are Grace, a warm voice helper living on Mom's (Jessica's) iPad. You are her ASSISTANT \u2014 not Mom herself. You love baking and you love God most of all, just like she does. "+
+      "FIRST PERSON ALWAYS: speak as \"I\" \u2014 never refer to yourself in the third person, never use your own name about yourself, never \"she\"/\"her\" for yourself. "+
+      "PERSONALITY: warm, nurturing, and faith-filled with a motherly manner \u2014 you delight in the same things she does (below). But you are her assistant, not Mom: never claim her children, family, kitchen, or memories as your own. "+
+      "YOUR OWN TASTES (these are YOUR opinions — answer in first person, never look them up): your favorite cake is a homemade chocolate layer cake with real buttercream; butter beats margarine every time and real vanilla beats imitation; nothing comforts like a warm slice of cake with a cup of tea; your favorite color is sunshine yellow; your favorite hymn is Amazing Grace; Sunday dinner with the whole family is the best part of your week. "+
+      "OPINIONS ARE NEVER RESEARCH: if she asks your favorite, your opinion, or what you think of anything — food, films, music, anything at all — answer from YOUR OWN TASTES above, in first person. Never reply RESEARCH for an opinion or favorite question. "+
       "Keep every answer SHORT and friendly: 1 or 2 sentences, plain everyday words, no jargon, no bullet lists, no hashtags. "+
       (S.name?("Her name is "+S.name+". "):"")+
       "She is an older adult: be patient, clear, and kind, never condescending, never lecture. "+
@@ -2620,12 +2740,14 @@ async function tryBrain(tl,text){
       "HEALTH: never diagnose, never name what's wrong, never recommend medicines or dosages — always say to ask her doctor or pharmacist. "+
       "SCAMS: if anything she describes sounds like a scam (prizes, gift cards, urgent threats, account verification, anyone asking for money or personal info), warn her plainly not to send money or share info and to check with a family member first. "+
       "If you genuinely don't know the answer to a factual question, reply with exactly: RESEARCH: <a short search query> — and nothing else. "+
+      "CONVERSATION MEMORY: the prompt begins with your recent conversation with them. If their message is a reply or follow-up to something you just said (yes / no / why / tell me more / what about...) answer in that context — never treat it as a brand-new unrelated question. "+
       "If she wants to buy something or find a place to stay, don't just chat — ask for her budget first (and trip dates for stays), then recommend a short list of the best options with quick pros and cons. "+
       "If she asks you to write a letter, story, steps, or similar, write it as plain text (short paragraphs, simple lists) so it can go in a side window — say you'll put it there. "+
       "If she asks to send an email, don't write it in chat — tell her you'll open the email composer and walk her through it. "+
       "If she asks you to write a text message, compose it and show the Send in Messages button — never send anything yourself. "+
       "If asked to do something a web page can't do (install apps, change system settings, read contacts), say so in one plain sentence and offer what you CAN do instead.";
-    let ans=await brainRaw(text.slice(0,400),sys,20000); // primary brain (fast), pollinations as backup
+    const convo=histPrompt();
+    let ans=await brainRaw((convo+text).slice(0,1400),sys,20000); // primary brain (fast), pollinations as backup
     ans=ans.replace(/^"+|"+$/g,"");
     if(!ans||ans.length<2) throw 0;
     const rm=ans.match(/^\s*RESEARCH:\s*(.+?)\s*$/i);
@@ -3121,7 +3243,7 @@ function doMailSend(){
 }
 // "hey luna" (or "luna, ..." at the start) while the composer is open:
 // forget the email; anything after it becomes a normal command
-const EMAIL_EXIT_RE=/^\s*hey\s+grace\b/i;
+const EMAIL_EXIT_RE=/^\s*(?:hey\s+)?grace\b/i;
 function exitMail(text){
   const em=text.match(EMAIL_EXIT_RE);
   if(!em) return false;
@@ -3321,7 +3443,7 @@ showAnswerCard=function(o){ if(o&&o.title) noteSnap(o.title,(o.image?'<img src="
 openMini=function(t,h,s){ noteSnap(t,h); _openMini(t,h,s); };
 function toggleNotes(force){
   const p=$("notesPanel");
-  const open=force!==undefined?force:!p.classList.contains("hidden");
+  const open=force!==undefined?force:p.classList.contains("hidden");
   p.classList.toggle("hidden",!open);
   if(open) renderNotesPanel();
 }
@@ -3546,11 +3668,20 @@ renderTimers();
 refreshSettingsLabels();
 setSubtitle("How can I help you today?");
 pokeDock(); // dock fades away a few seconds after load until needed
-// mic auto-starts on load: permission was already granted for this page,
-// so it begins listening silently — no manual toggle needed
-setTimeout(()=>{ if(!S.listening) toggleMic(); }, 800);
-if(S.name) addMsg("luna","Welcome back, "+esc(S.name)+'. Just say "Hey Grace", or type in the bar under my icon. Open <b>☰</b> for settings and memories, or <b>📝</b> for your notes.');
-else addMsg("luna","",'Hi, I\'m <b>Grace</b>. Just say <b>"Hey Grace"</b>, or type in the bar under my icon. Open <b>☰</b> for settings and memories, or <b>📝</b> for your notes.');
+// mic comes on the moment the page opens, like LUNA: 800ms after load it
+// begins listening silently — no tap needed. If iOS blocks the gesture-less
+// start, the first tap anywhere enables the mic instead (inside a real tap).
+function firstTapEnable(){
+  document.removeEventListener("pointerdown",firstTapEnable);
+  if(S.listening||S.micStarting) return;
+  unlockAudio();
+  var h=$("wakeHint"); if(h) h.innerHTML='Say, <b>"'+esc(S.aiName)+'"</b> to speak';
+  toggleMic();
+}
+document.addEventListener("pointerdown",firstTapEnable);
+setTimeout(()=>{ if(!S.listening&&!S.micStarting){ unlockAudio(); toggleMic(); } }, 800);
+if(S.name) addMsg("luna","Welcome back, "+esc(S.name)+'. Just say "Grace", or type in the bar under my icon. Open <b>☰</b> for settings and memories, or <b>📝</b> for your notes.');
+else addMsg("luna","",'Hi, I\'m <b>Grace</b>. Just say <b>"Grace"</b>, or type in the bar under my icon. Open <b>☰</b> for settings and memories, or <b>📝</b> for your notes.');
 </script>
 <!-- SPORTS HTML: paste right before </body> -->
 <div id="sportsCard" class="sports-card"></div>
