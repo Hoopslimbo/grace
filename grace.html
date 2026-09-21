@@ -697,8 +697,7 @@ function listenBriefly(ms){
 function loadFail(){
   const msg="I'm sorry, could you say that again?";
   addMsg("luna",msg);
-  setSubtitle(msg);
-  utter(msg,()=>{ listenBriefly(3000); });
+  speak(msg,{chat:false,onDone:()=>{ listenBriefly(3000); }});
 }
 
 // ---------- answer card (image popup while she talks) ----------
@@ -797,7 +796,9 @@ function aiSpeaking(){
   return !!netAudioEl;
 }
 
-function utter(text,onDone){
+// the words and the voice start together, every time: nothing is displayed
+// until her audio actually begins (works for both net and device voices)
+function utter(text,onDone,onStart){
   S.lastSpoken=text;
   if(S.muted){
     // muted: show the caption briefly, then hide it like speech did
@@ -805,16 +806,21 @@ function utter(text,onDone){
     return;
   }
   const my=++speakToken;
+  // onStart fires the moment her audio actually begins — exactly once, and
+  // never for an utterance that got superseded
+  let started=false;
+  const fireStart=()=>{ if(started) return; started=true; if(my===speakToken&&onStart){ try{onStart();}catch(e){} } };
+  setTimeout(fireStart,15000); // backstop: the words never stay hidden forever
   // hard-stop anything current. No resume() here: resuming at this point can
   // briefly revive a paused corpse utterance -> start/stop/restart stutter.
   try{ if(speechSynthesis.speaking||speechSynthesis.pending) speechSynthesis.cancel(); }catch(e){}
   stopNetAudio();
   clearInterval(S.resumeTimer); clearTimeout(S.speechWatch);
-  if(USE_NET_VOICE){ netUtter(text,my,onDone); return; }
-  deviceUtter(text,my,onDone);
+  if(USE_NET_VOICE){ netUtter(text,my,onDone,fireStart); return; }
+  deviceUtter(text,my,onDone,fireStart);
 }
 
-function netUtter(text,my,onDone){
+function netUtter(text,my,onDone,onStart){
   const words=text.split(/\s+/).length;
   const fin=()=>{
     clearInterval(S.resumeTimer); clearTimeout(S.speechWatch);
@@ -832,15 +838,18 @@ function netUtter(text,my,onDone){
   // cosmetic ring pulse while the network audio plays (no onboundary here)
   clearInterval(S.resumeTimer);
   S.resumeTimer=setInterval(()=>{ S.pulse=1; },900);
-  const a=new Audio();
+  const a=(audioUnlocked&&ttsAudio)||new Audio();
+  try{ a.pause(); }catch(e){}
   netAudioEl=a;
   let finished=false;
-  const done=()=>{ if(finished||my!==speakToken) return; finished=true; netAudioEl=null; fin(); };
-  const fallBack=()=>{ if(finished||my!==speakToken) return; finished=true; netAudioEl=null; deviceUtter(text,my,onDone); };
+  const done=()=>{ if(finished||my!==speakToken) return; finished=true; netAudioEl=null; if(onStart)onStart(); fin(); };
+  const fallBack=()=>{ if(finished||my!==speakToken) return; finished=true; netAudioEl=null; deviceUtter(text,my,onDone,onStart); };
   a.onended=done;
+  a.onplaying=()=>{ if(onStart) onStart(); }; // her words appear the moment the audio starts
   a.onerror=fallBack;
   a.src="https://api.streamelements.com/kappa/v2/speech?voice="+encodeURIComponent(NET_VOICE_NAME)+
         "&text="+encodeURIComponent(String(text).slice(0,800));
+  try{ a.load(); }catch(e){}
   try{
     const p=a.play();
     if(p&&p.catch) p.catch(fallBack);
@@ -853,11 +862,12 @@ function netUtter(text,my,onDone){
 }
 
 // device-voice path: the original utter() body, used as automatic fallback
-function deviceUtter(text,my,onDone){
+function deviceUtter(text,my,onDone,onStart){
   const u=new SpeechSynthesisUtterance(text);
   const v=pickVoice(); if(v) u.voice=v;
   u.rate=1.02; u.pitch=1;
   u.onstart=()=>{
+    if(onStart)onStart(); // her words appear the moment her voice starts
     S.orbMode="speaking"; S.pulse=1; pokeDock();
     // unstick Chrome's paused-speech bug, but only while actually speaking
     clearInterval(S.resumeTimer);
@@ -865,6 +875,7 @@ function deviceUtter(text,my,onDone){
   };
   u.onboundary=()=>{ S.pulse=1; };           // each spoken word kicks the ring
   const fin=()=>{
+    if(onStart)onStart(); // safety: words show even if speech errored instantly
     clearInterval(S.resumeTimer); clearTimeout(S.speechWatch);
     if(S.orbMode==="speaking") S.orbMode="idle";
     // 2s follow-up window: she'll hear you without the wake word
@@ -1082,10 +1093,19 @@ async function handleSports(q){
   return true;
 }
 
-function speak(text){
-  addMsg("luna",text);
-  setSubtitle(text);
-  utter(text);
+// she shows the words exactly when she starts saying them — never before.
+// opts: {onDone, chat:false} — chat:false shows only the subtitle (no transcript line)
+function speak(text,opts){
+  text=String(text||""); if(!text.trim()) return;
+  opts=opts||{};
+  let shown=false;
+  function show(){
+    if(shown) return; shown=true;
+    setSubtitle(text);
+    if(opts.chat!==false) addMsg("luna",text);
+  }
+  if(S.muted){ show(); utter(text,opts.onDone); return; }
+  utter(text,opts.onDone,show);
 }
 function setStatus(live, txt){
   statusText.textContent=txt;
@@ -1155,10 +1175,16 @@ function startListening(){
   };
   r.onerror=(e)=>{
     if(e.error==="not-allowed"||e.error==="service-not-allowed"){
+      // iOS fires this transiently when the mic is momentarily busy (e.g. right
+      // after she finished talking). Retry a few times before giving up.
+      S.micRetries=(S.micRetries||0)+1;
+      if(S.micRetries<=3){ setTimeout(()=>{ if(S.listening){ try{ S.recog.start(); }catch(_){} } },800); return; }
+      S.micRetries=0;
       stopListening(); setStatus(false,"MIC BLOCKED");
       speak("Microphone access was blocked. Allow the microphone, then press the mic button.");
     }else if(e.error==="audio-capture"){ stopListening(); setStatus(false,"NO MICROPHONE"); }
   };
+  r.onstart=()=>{ S.micRetries=0; };
   r.onspeechstart=()=>{ hidePrompt(); clearTimeout(S.promptRestoreT); };
   r.onspeechend=()=>{
     // user stopped, but she may be about to answer: stay hidden until her
@@ -1169,9 +1195,14 @@ function startListening(){
   };
   r.onend=()=>{
     if(!S.listening) return;
-    // debounce restarts: a failing start() must never spin into a prompt loop
+    // debounce restarts so a failing start() can't spin into a prompt loop —
+    // but a restart is ALWAYS eventually scheduled, so the mic never dies silently
     const now=Date.now();
-    if(now-S.lastRestart<2000) return;
+    if(now-S.lastRestart<2000){
+      clearTimeout(S.restartT);
+      S.restartT=setTimeout(()=>{ if(S.listening){ S.lastRestart=Date.now(); try{ S.recog.start(); }catch(e){} } }, 2000-(now-S.lastRestart)+50);
+      return;
+    }
     S.lastRestart=now;
     try{ r.start(); }catch(err){ setTimeout(()=>{ if(S.listening){ try{S.recog.start();}catch(e2){} } },400); }
   };
@@ -1187,7 +1218,23 @@ function startListening(){
 // mic button = soft toggle. One getUserMedia stream is held for the whole page
 // session (a single permission grant); after that the button just mutes/unmutes
 // input and speech recognition rides on the already-granted mic.
+
+// ---- iOS/iPadOS hardening (2026-09-21): the iPad's mic/audio rules differ from desktop ----
+const IS_IOS=/iPad|iPhone|iPod/.test(navigator.userAgent)||(navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1);
+const SILENT_WAV="data:audio/wav;base64,UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+let ttsAudio=null, audioUnlocked=false;
+function unlockAudio(){
+  // MUST run inside a real user tap: plays a silent blip so the iPad allows
+  // sound later, and warms up speechSynthesis so it isn't silent either.
+  if(audioUnlocked) return; audioUnlocked=true;
+  try{ ttsAudio=new Audio(SILENT_WAV); const p=ttsAudio.play(); if(p&&p.catch)p.catch(()=>{}); }catch(e){}
+  try{ const C=window.AudioContext||window.webkitAudioContext;
+       if(C){ const ctx=new C(); if(ctx.state==="suspended")ctx.resume(); unlockAudio.ctx=ctx; } }catch(e){}
+  try{ speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(" "); u.volume=0; speechSynthesis.speak(u); }catch(e){}
+}
+
 async function ensureMicStream(){
+  if(IS_IOS) return true; // iPad/iPhone: speech recognition owns the mic; a held gUM stream fights it and re-prompts
   if(S.micStream) return true;
   try{
     if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia) return true;
@@ -1243,7 +1290,11 @@ function routeHeard(finals,interim){
   if(m) cancelGen(); // her name breaks through: tell any long job to stop quietly
   const emailHot=!!(S.mail&&S.mail.open);
   const inFollowUp=Date.now()<S.followUpUntil||(emailHot&&!aiSpeaking());
-  if(!m&&!inFollowUp) return;
+  if(!m&&!inFollowUp){
+    // she just acted but you're still talking: don't drop the rest — hear it as a new command
+    if(Date.now()<(S.recentCmdUntil||0)&&text.replace(/[.,!?…\s]/g,"").length>1){ queueCommand(text); return; }
+    return;
+  }
   // email exit hatch: while the composer is open, "hey luna" (or "luna, ...")
   // forgets the email; anything after it becomes a normal command
   if(emailHot){
@@ -1280,7 +1331,14 @@ function routeHeard(finals,interim){
 let cmdBuf="", cmdTimer=null;
 function pokeCmdTimer(){
   clearTimeout(cmdTimer);
-  cmdTimer=setTimeout(()=>{ const c=cmdBuf.trim(); cmdBuf=""; S.awaiting=false; if(c) handleCommand(c); },1100);
+  // she listens until you actually stop talking: every new word restarts the
+  // silence timer, and she only acts after a real ~2.5s pause
+  cmdTimer=setTimeout(()=>{
+    const c=cmdBuf.trim(); cmdBuf=""; S.awaiting=false;
+    // just-handled window: if you're still talking, the rest gets heard too
+    S.recentCmdUntil=Date.now()+5000;
+    if(c) handleCommand(c);
+  },2500);
 }
 function queueCommand(t){ cmdBuf=(cmdBuf+" "+t).trim(); pokeCmdTimer(); }
 </script>
@@ -1601,6 +1659,7 @@ async function tryGraceRecipe(tl,text){
     const rec=getGraceRecipes().find(r=>{ const n=String(r.name).toLowerCase(); return n===want||n.includes(want)||want.includes(n); });
     if(!rec||!rec.steps||!rec.steps.length){ speak("I couldn't find a saved recipe called "+want+"."); return true; }
     S.recipeName=rec.name; S.recipeSteps=rec.steps.slice(); S.recipeIdx=0;
+    openDoc("🍰 "+S.recipeName, mdLite(S.recipeSteps.map((s,i)=>(i+1)+". "+s).join("\n")), S.recipeSteps.map((s,i)=>(i+1)+". "+s).join("\n"));
     recipeSay(); return true;
   }
   // step navigation while a recipe is open
@@ -1624,7 +1683,8 @@ async function tryGraceRecipe(tl,text){
     if(!steps.length) throw 0;
     S.recipeName=dish.replace(/\w\S*/g,w=>w.charAt(0).toUpperCase()+w.slice(1));
     S.recipeSteps=steps; S.recipeIdx=0;
-    speak("Here's "+S.recipeName+", hon. Say save this recipe if you'd like to keep it.");
+    openDoc("🍰 "+S.recipeName, mdLite(steps.map((s,i)=>(i+1)+". "+s).join("\n")), steps.map((s,i)=>(i+1)+". "+s).join("\n"));
+    speak("Here's "+S.recipeName+", hon \u2014 the full list is in the window, and I'll walk you through it. Say save this recipe if you'd like to keep it.");
     recipeSay();
   }catch(e){ S.orbMode="idle"; speak("I couldn't pull up a recipe for that just now. Try asking again."); }
   return true;
@@ -1994,7 +2054,7 @@ async function conciergeFollowup(tl,text){
       const ans=firstSentences(raw,3);
       showAnswerCard({title:a.name+" vs "+b.name,image:null,text:ans});
       addMsg("luna",ans);
-      setSubtitle(ans); utter(ans,()=>{ if(!S.muted) cardUntilDone(); });
+      speak(ans,{chat:false,onDone:()=>{ if(!S.muted) cardUntilDone(); }});
     }catch(e){ loadFail(); }
     return true;
   }
@@ -2117,7 +2177,7 @@ async function openYouTubeFirst(q){
       '<p style="margin-top:8px"><a href="https://www.youtube.com/watch?v='+hit.id+'" target="_blank" rel="noopener">Open on YouTube</a></p>');
     addMsg("luna","",'Playing the top video'+(hit.title?': <b>'+esc(hit.title)+'</b>':' for <b>'+esc(q)+'</b>')+'. <a href="https://www.youtube.com/watch?v='+hit.id+'" target="_blank" rel="noopener">Open on YouTube</a>');
     const spoken=hit.title?("Playing "+hit.title+"."):("Playing the top video about "+q+".");
-    setSubtitle(spoken); utter(spoken);
+    speak(spoken,{chat:false});
   }else{
     // video API unreachable: fall back to the filtered search (videos only, no Shorts)
     openUrl(searchUrl,"YouTube search","I couldn't pull the video itself, so here are the top results — the first one is the one you want.");
@@ -2133,8 +2193,7 @@ function openYouTubeSearch(q){
   if(w){
     addMsg("luna","",'YouTube results for <b>'+esc(q)+'</b>: <a href="'+url+'" target="_blank" rel="noopener">open</a>');
     const spoken="Pulling up YouTube results for "+q+".";
-    setSubtitle(spoken);
-    utter(spoken);
+    speak(spoken,{chat:false});
   }else{
     openYouTubeWindow(q);
     addMsg("luna","","Heads up: Chrome blocked the new tab, so the video is playing in the window above instead.");
@@ -2471,8 +2530,7 @@ async function answerFromResearch(question,query){
     const brief=firstSentences(ans,3);
     showAnswerCard({title:cap1(query),image:null,text:brief});
     addMsg("luna","", "<b>"+esc(cap1(query))+"</b><br>"+esc(ans));
-    setSubtitle(brief);
-    utter(brief,()=>{ if(!S.muted) cardUntilDone(); });
+    speak(brief,{chat:false,onDone:()=>{ if(!S.muted) cardUntilDone(); }});
   }catch(e){
     loadFail();
   }
@@ -2500,8 +2558,7 @@ async function tryWiki(tl,text){
     const spoken=firstSentences(w.extract,2);
     showAnswerCard({title:w.title,image:w.thumb,text:spoken});
     addMsg("luna",'', "<b>"+esc(w.title)+"</b><br>"+esc(w.extract)+'<br><a href="'+esc(w.link)+'" target="_blank" rel="noopener">Read more on Wikipedia</a>');
-    setSubtitle(spoken);
-    utter(spoken,()=>{ if(!S.muted) cardUntilDone(); });
+    speak(spoken,{chat:false,onDone:()=>{ if(!S.muted) cardUntilDone(); }});
   }catch(e){ loadFail(); }
   return true;
 }
@@ -2580,8 +2637,7 @@ async function tryBrain(tl,text){
     ans=ans.slice(0,600);
     addMsg("luna",ans);
     const spoken=firstSentences(ans,2);
-    setSubtitle(spoken);
-    utter(spoken);
+    speak(spoken,{chat:false});
   }catch(e){ smallTalkFallback(); }
   return true;
 }
@@ -2732,7 +2788,7 @@ $("docCopy").onclick=async()=>{
 async function tryWriter(tl,text){
   if(/e-?mail/.test(tl)) return false;
   let kind=null, topic=null, m;
-  if(m=tl.match(/(?:write|compose|create|draft)(?: me)? (?:a |an )?(essay|paragraph|story|poem|speech|letter|article|report|summary|haiku|rap|song)(?: about| on| over)?\s+(.+)/)){
+  if(m=tl.match(/(?:write|compose|create|draft|tell)(?: me)? (?:a |an )?(essay|paragraph|story|poem|speech|letter|article|report|summary|haiku|rap|song)(?: about| on| over)?\s+(.+)/)){
     kind=m[1]; topic=m[2];
   }else if(m=tl.match(/(?:write|create|make)(?: me)? (?:a |an )?(?:step[ -]by[ -]step guide|guide)(?: to| for| on| about)?\s+(.+)/)){
     kind="guide"; topic=m[1];
@@ -2740,29 +2796,40 @@ async function tryWriter(tl,text){
     kind="steps"; topic=m[1];
   }else if(m=tl.match(/^(?:plan(?:\s+out)?(?:\s+me)?|help me plan|make(?: me)? a plan(?: for| to)?)\s+(.+)/)){
     kind="plan"; topic=m[1];
+  }else if(m=tl.match(/(?:make|write|create|give me)(?: me)? a list of\s+(.+)/)){
+    kind="list"; topic=m[1];
+  }else if((m=tl.match(/\bhow (?:do|can|should) i\s+(.+)/))||(m=tl.match(/\bhow to\s+([a-z][\w\s\'-]{2,})/))){
+    kind="howto"; topic=(m[1]||"").trim();
+    if(topic.length<4||/^(say|spell|pronounce|translate)\b/.test(topic)) return false;
   }else return false;
   topic=topic.trim().replace(/[?.!]+$/,"");
   if(topic.length<2){ speak("What should I write about?"); return true; }
   if(!needWeb()) return true;
   const steps=(kind==="steps"||kind==="guide");
   const plan=(kind==="plan");
-  const label=steps?"Step-by-step guide":plan?"Plan":kind;
+  const howto=(kind==="howto");
+  const list=(kind==="list");
+  const label=steps?"Step-by-step guide":plan?"Plan":howto?"How-to guide":list?"List":kind;
   setSubtitle("Writing…");
   let raw="";
   try{
     raw=await brainRaw(
       steps?("Write a clear step-by-step guide for: "+topic+". Numbered steps, each 1-2 sentences. Plain text, no intro fluff, no conclusion.")
            :plan?("Write a fun, practical plan for: "+topic+". Use short sections with **bold headers** and bullet points of concrete ideas. Honor every constraint in the request (for example, if they say to use only things already at home, every idea must use ordinary household stuff). No intro fluff, no conclusion.")
+           :howto?("Explain how to "+topic+". Reply as numbered steps, each 1-2 sentences. Plain text, no intro fluff, no conclusion.")
+           :list?("Make a list about: "+topic+". Reply with bullet points using '- ', one per line, each 1-2 sentences. No intro fluff, no conclusion.")
            :("Write "+(/^[aeiou]/.test(kind)?"an ":"a ")+kind+" about "+topic+". About 250-350 words. Plain text with short paragraphs."),
       steps?"You write concise numbered how-to guides. Plain text only, no markdown tables."
            :plan?"You write fun, practical plans with bold section headers and bullet points."
+           :howto?"You write concise numbered how-to guides. Plain text only."
+           :list?"You write concise bullet lists. Plain text only, '- ' bullets."
            :"You write short essays and stories. Plain text only, short paragraphs.", 25000);
   }catch(e){ loadFail(); return true; }
   raw=raw.trim();
   if(raw.length<10){ loadFail(); return true; }
   openDoc("\u270D\uFE0F "+cap1(label)+": "+cap1(topic), mdLite(raw), raw);
   speak("Done — it's in the window on the right. It'll stay up until you say hey "+S.aiName+" again, and you can copy it with the copy button.");
-  addMsg("luna","","Wrote "+(steps?"a step-by-step guide":plan?"a plan":"a "+kind)+" about <b>"+esc(topic)+"</b> — it's in the side window.");
+  addMsg("luna","","Wrote "+(steps?"a step-by-step guide":plan?"a plan":howto?"a how-to guide":list?"a list":"a "+kind)+" about <b>"+esc(topic)+"</b> — it's in the side window.");
   return true;
 }
 
@@ -3226,12 +3293,12 @@ const SCAM_RE=/you'?ve (won|been selected)|\bwon\b.*\b(lottery|sweepstakes|prize
 async function tryGuardrails(tl,text){
   if(HEALTH_RE.test(tl)){
     const msg="I'm not a doctor, hon, so I can't say what's wrong or what medicine to take. Please call your doctor or pharmacist about that — they'll know what's safe for you.";
-    addMsg("luna",msg); setSubtitle(msg); utter(msg);
+    addMsg("luna",msg); speak(msg,{chat:false});
     return true;
   }
   if(SCAM_RE.test(tl)){
     const msg="That sounds like it could be a scam, hon. Please don't send any money or share personal information. Check with a family member first — it's always okay to ask.";
-    addMsg("luna",msg); setSubtitle(msg); utter(msg);
+    addMsg("luna",msg); speak(msg,{chat:false});
     return true;
   }
   return false;
@@ -3335,7 +3402,7 @@ async function showVideoCard(q){
     '<p><a href="'+watch+'" target="_blank" rel="noopener">\u25B6 Open on YouTube</a></p>';
   openMini("\u25B6 "+(hit.title||cap1(q)), html);
   addMsg("luna","",'Top video'+(hit.title?': <b>'+esc(hit.title)+'</b>':' for <b>'+esc(q)+'</b>')+'. <a href="'+watch+'" target="_blank" rel="noopener">Open on YouTube</a>');
-  setSubtitle(spoken); utter(spoken);
+  speak(spoken,{chat:false});
   return true;
 }
 async function playSong(q){
@@ -3348,12 +3415,12 @@ async function playSong(q){
     const watch="https://www.youtube.com/watch?v="+hit.id;
     openUrl(watch,"Playing: "+(hit.title||q),"");
     const spoken="Playing "+(hit.title||q)+".";
-    setSubtitle(spoken); utter(spoken);
+    speak(spoken,{chat:false});
   }else{
     const url="https://www.youtube.com/results?search_query="+encodeURIComponent(q);
     openUrl(url,"YouTube search for "+q,"");
     const spoken="I couldn't start it directly, so here are the top results — the first one is your song.";
-    setSubtitle(spoken); utter(spoken);
+    speak(spoken,{chat:false});
   }
   return true;
 }
@@ -3450,10 +3517,10 @@ function wireAdd(inputId,btnId,fn){
 wireAdd("memIn","memAdd",v=>{ if(v.trim()){ addMemory(v); speak("I'll remember that."); } });
 
 /* ---------------- dock controls ---------------- */
-btnMic.onclick=toggleMic;
+btnMic.onclick=()=>{ unlockAudio(); toggleMic(); };
 btnMute.onclick=()=>{ S.muted=!S.muted; store.set("muted",S.muted); updateMuteBtn(); if(!S.muted) speak("Voice on."); else { addMsg("luna","Voice muted."); setSubtitle("Voice muted."); } };
 btnRepeat.onclick=()=>{ if(S.lastSpoken) speak(S.lastSpoken); };
-function submitText(){ const v=textIn.value.trim(); if(!v) return; textIn.value=""; handleCommand(v); }
+function submitText(){ unlockAudio(); const v=textIn.value.trim(); if(!v) return; textIn.value=""; handleCommand(v); }
 btnAsk.onclick=submitText;
 textIn.addEventListener("keydown",e=>{ if(e.key==="Enter") submitText(); });
 
