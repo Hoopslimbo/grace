@@ -752,7 +752,12 @@ if("speechSynthesis" in window){ speechSynthesis.onvoiceschanged=()=>{}; pickVoi
 function beep(freq,dur,when){
   try{
     const C=window.AudioContext||window.webkitAudioContext; if(!C) return;
-    const ctx=beep.ctx||(beep.ctx=new C());
+    // reuse the tap-unlocked audio context: a fresh AudioContext made here stays
+    // suspended on iOS (no user gesture at chime time), which made the wake
+    // chime silent even though her voice worked fine
+    let ctx=(typeof unlockAudio!=="undefined"&&unlockAudio.ctx)||beep.ctx;
+    if(!ctx){ ctx=new C(); beep.ctx=ctx; }
+    if(ctx.state==="suspended"){ try{ctx.resume();}catch(e){} }
     const o=ctx.createOscillator(), g=ctx.createGain();
     o.type="sine"; o.frequency.value=freq;
     const t=ctx.currentTime+(when||0);
@@ -1314,7 +1319,20 @@ function routeHeard(finals,interim){
   if(!text) return;
   // still assembling a command? keep gathering until ~1.1s of silence
   if(S.awaiting||cmdBuf){
-    if(finals.trim()) queueCommand(finals.trim());
+    if(finals.trim()){
+      const ft=finals.trim(), wm=ft.match(WAKE_RE);
+      // repeated "hey <name>" while already awake: that's a wake, not a command.
+      // refresh the window and re-ding instead of running their name as a command
+      // (before, the repeat landed in the transcript and went nowhere)
+      if(wm&&ft.slice(wm.index+wm[0].length).replace(/[.,!?…\s]/g,"").length<=1){
+        S.followUpUntil=Date.now()+2000; S.awaiting=true;
+        S.orbMode="heard"; chime(); pokeDock();
+        setTimeout(()=>{ if(S.awaiting){ S.awaiting=false; S.orbMode="idle"; S.buffer=""; } },9000);
+        S.ignoreUntil=Date.now()+1400; S.buffer="";
+        return;
+      }
+      queueCommand(ft);
+    }
     else if(interim.trim()) pokeCmdTimer();
     return;
   }
@@ -3673,13 +3691,16 @@ pokeDock(); // dock fades away a few seconds after load until needed
 // start, the first tap anywhere enables the mic instead (inside a real tap).
 function firstTapEnable(){
   document.removeEventListener("pointerdown",firstTapEnable);
+  unlockAudio(); // first tap is a REAL gesture: unlock the voice even if the mic already auto-started
   if(S.listening||S.micStarting) return;
-  unlockAudio();
   var h=$("wakeHint"); if(h) h.innerHTML='Say, <b>"'+esc(S.aiName)+'"</b> to speak';
   toggleMic();
 }
 document.addEventListener("pointerdown",firstTapEnable);
-setTimeout(()=>{ if(!S.listening&&!S.micStarting){ unlockAudio(); toggleMic(); } }, 800);
+// NOTE: no unlockAudio() in this timer — iOS ignores audio unlocks outside a real
+// tap, but the "unlocked" flag would still be set, leaving the voice silent until
+// you type something. The unlock happens on the first real tap above instead.
+setTimeout(()=>{ if(!S.listening&&!S.micStarting){ toggleMic(); } }, 800);
 if(S.name) addMsg("luna","Welcome back, "+esc(S.name)+'. Just say "Grace", or type in the bar under my icon. Open <b>☰</b> for settings and memories, or <b>📝</b> for your notes.');
 else addMsg("luna","",'Hi, I\'m <b>Grace</b>. Just say <b>"Grace"</b>, or type in the bar under my icon. Open <b>☰</b> for settings and memories, or <b>📝</b> for your notes.');
 </script>
